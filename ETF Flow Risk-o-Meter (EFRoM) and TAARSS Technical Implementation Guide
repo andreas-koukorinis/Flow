@@ -1,0 +1,261 @@
+# ETF Flow Risk-o-Meter (EFRoM) and TAARSS Technical Implementation Guide
+
+taarss_computation:
+  title: "Computing TAARSS Precisely from Raw ETF Flow Data"
+  
+  step_1_data_collection:
+    description: "Collect and normalize ETF flow data"
+    process:
+      - collect_daily_flows: "Gather daily net cash flows in dollars"
+      - normalize_by_aum: "Normalized Flow[t] = Cash Flow[t] / AUM[t]"
+      - create_cumulative: "Y[i] = Σ(Normalized Flow[1 to i])"
+    
+  step_2_dual_regression:
+    formula: "TAARSS = β₁(SLRTO) × R²(SLR)"
+    components:
+      slrto:
+        name: "Single Linear Regression Through Origin"
+        equation: "Ŷᵢ = β₁Xᵢ"
+        slope_calculation: "β₁ = Σ(XᵢYᵢ) / Σ(Xᵢ²)"
+      slr:
+        name: "Standard Linear Regression"
+        equation: "Ŷᵢ = β₀ + β₁Xᵢ"
+        r_squared: "R² = 1 - [Σ(Yᵢ - Ŷᵢ)²] / [Σ(Yᵢ - Ȳ)²]"
+    variables:
+      x: "days in calculation period (1, 2, 3, ..., n)"
+      y: "cumulative normalized flow as % of AUM at day i"
+
+regression_rationale:
+  title: "Why Both Regression Types Are Needed"
+  
+  slope_through_origin:
+    purpose: "Captures raw directional strength of flows"
+    interpretation:
+      positive: "inflows"
+      negative: "outflows"
+    advantage: "Forces proportionality - assumes zero flows at time zero"
+    intuition: "Measures average daily flow rate without baseline bias"
+  
+  standard_regression:
+    purpose: "Measures flow trend stability via R²"
+    interpretation:
+      high_r2: "steady, consistent flows"
+      low_r2: "erratic flows"
+    advantage: "Allows for initial flow conditions (intercept β₀)"
+    intuition: "Distinguishes between volatile spikes and sustained trends"
+  
+  combined_signal:
+    strong: "Large Magnitude (|β₁|) × High Consistency (R²)"
+    weak: "Either small |β₁| OR low R²"
+    rationale: "Multiplicative approach ensures both sustained direction AND consistency required"
+
+anomaly_corrections:
+  title: "Correcting for ETF Flow Anomalies"
+  
+  creation_redemption_spikes:
+    detection: "Daily flows > 3σ from rolling mean"
+    correction: "Winsorization at 95th percentile or MAD filtering"
+    implementation: |
+      if abs(daily_flow) > 3 * rolling_std:
+          corrected_flow = sign(daily_flow) * min(abs(daily_flow), 95th_percentile)
+  
+  market_maker_inventory:
+    issue: "Large block trades distorting true investor sentiment"
+    solution: "Use 3-5 day moving average of flows"
+    filter: "Exclude flows where single transaction > 20% of daily volume"
+  
+  calendar_effects:
+    month_end_rebalancing: "Apply seasonal adjustment factors"
+    ex_dividend_dates: "Normalize flows around distribution events"
+    formula: "Adjusted_Flow = Raw_Flow - Seasonal_Component - Distribution_Impact"
+  
+  small_aum_distortions:
+    issue: "Small ETFs show excessive percentage changes"
+    solution: "Apply AUM-weighted adjustments"
+    formula: |
+      Weight_factor = min(1, AUM / AUM_threshold)
+      Adjusted_TAARSS = Raw_TAARSS * Weight_factor
+
+fixed_income_generalization:
+  title: "Generalizing TAARSS to Fixed Income Markets"
+  
+  corporate_bond_segmentation:
+    by_rating:
+      aaa_aa_ig_superior: -0.3
+      a_bbb_ig_standard: -0.1
+      bb_hy_quality: 0.3
+      b_ccc_hy_speculative: 0.7
+    
+    by_maturity:
+      0_2_years: "Factor × 0.5"
+      2_5_years: "Factor × 0.8"
+      5_10_years: "Factor × 1.0"
+      10_plus_years: "Factor × 1.3"
+  
+  sector_specific:
+    financial_bonds:
+      segments: ["Banks", "Insurance", "REITs"]
+      adjustment: "TAARSS_Financial = Base_TAARSS × (1 + Systemic_Risk_Premium)"
+    
+    energy_bonds:
+      oil_price_regimes:
+        low_wti_below_40: "Risk_Factor × 1.5"
+        medium_wti_40_70: "Risk_Factor × 1.0"
+        high_wti_above_70: "Risk_Factor × 0.8"
+  
+  curve_analysis:
+    multi_factor_formula: "TAARSS_Curve = w1*TAARSS_2Y + w2*TAARSS_5Y + w3*TAARSS_10Y + w4*TAARSS_30Y"
+    strategies:
+      steepener:
+        w1: -1
+        w4: 1
+      flattener:
+        w1: 1
+        w4: -1
+      butterfly:
+        w1: -1
+        w2: 2
+        w3: -1
+  
+  issuer_specific:
+    sovereign_vs_corporate:
+      dm_vs_em: "Separate developed vs emerging market sovereigns"
+      country_risk: "Risk_Factor = Base_Factor × (1 + CDS_spread/1000)"
+    
+    single_issuer:
+      tracking: "Monitor flows into single-name corporate ETFs"
+      event_adjustment: "Exclude T-2 to T+2 around announcements"
+
+platform_integration:
+  title: "Integration into Fixed Income Research Platform"
+  
+  system_architecture:
+    data_pipeline: |
+      class TAARSSProcessor:
+          def __init__(self):
+              self.flow_data = FlowDataAPI()
+              self.reference_data = SecurityMaster()
+              self.risk_factors = RiskFactorConfig()
+          
+          def calculate_taarss(self, etf_ticker, lookback_days=60):
+              # 1. Fetch and clean data
+              flows = self.flow_data.get_flows(etf_ticker, lookback_days)
+              flows_cleaned = self.apply_anomaly_filters(flows)
+              
+              # 2. Normalize by AUM
+              aum = self.reference_data.get_aum_series(etf_ticker)
+              normalized_flows = flows_cleaned / aum
+              
+              # 3. Calculate cumulative flows
+              cumulative = normalized_flows.cumsum()
+              
+              # 4. Run dual regressions
+              slope_origin = self.regression_through_origin(cumulative)
+              r_squared = self.standard_regression_rsquared(cumulative)
+              
+              # 5. Compute TAARSS
+              return slope_origin * r_squared
+  
+  risk_factor_config:
+    fixed_income:
+      ust_short: -0.5
+      ust_long: -1.0
+      ig_corp: -0.3
+      hy_corp: 0.5
+      em_debt: 0.7
+      bank_loans: 0.4
+      munis: -0.2
+  
+  signal_aggregation: |
+    def calculate_efrom_fixed_income():
+        efrom_level = 0
+        for category, etf_list in fixed_income_universe.items():
+            for etf in etf_list:
+                taarss = calculate_taarss(etf)
+                risk_factor = risk_factors['Fixed_Income'][category]
+                efrom_level += taarss * risk_factor
+        return efrom_level
+  
+  integration_points:
+    portfolio_management:
+      - "Real-time signal updates via REST API"
+      - "WebSocket feed for flow anomalies"
+      - "Daily batch processing for signal recalculation"
+    
+    risk_management: |
+      # Risk-adjusted position sizing
+      position_size = base_size * (1 + efrom_signal * risk_multiplier)
+      position_size = np.clip(position_size, min_position, max_position)
+    
+    performance_attribution:
+      - "Decompose returns into TAARSS-driven vs residual"
+      - "Track signal decay over time horizons"
+      - "Backtest parameter sensitivity"
+    
+    alert_system: |
+      if abs(efrom_change) > threshold:
+          alert = {
+              'type': 'RISK_REGIME_CHANGE',
+              'level': 'HIGH' if abs(efrom_change) > 2*threshold else 'MEDIUM',
+              'action': 'INCREASE_RISK' if efrom_change > 0 else 'REDUCE_RISK',
+              'affected_positions': get_affected_positions()
+          }
+          send_alert(alert)
+  
+  advanced_features:
+    credit_spread_signal: |
+      credit_efrom = (TAARSS_HY * 0.5 + TAARSS_BankLoans * 0.3) - 
+                     (TAARSS_IG * 0.5 + TAARSS_UST * 0.5)
+    
+    duration_signal: |
+      duration_efrom = (TAARSS_LongDuration * 1.5) - (TAARSS_ShortDuration * 1.0)
+    
+    sector_rotation: |
+      sector_scores = {}
+      for sector in ['Financials', 'Energy', 'Tech', 'Healthcare']:
+          sector_scores[sector] = calculate_sector_taarss(sector) * 
+                                 get_sector_risk_factor(sector)
+      recommended_overweight = max(sector_scores, key=sector_scores.get)
+
+implementation_summary:
+  core_formula: "EFRoM Level = Σ[TAARSS[i] × Risk Factor[i]]"
+  
+  key_parameters:
+    lookback_period: 60  # days
+    anomaly_threshold: 3  # standard deviations
+    min_aum_threshold: 100000000  # $100M for reliability
+    rebalance_frequency: "monthly"
+  
+  asset_class_risk_factors:
+    risk_off:
+      us_treasuries: -1.0
+      gold: -1.0
+      corp_ig: -0.5
+      us_defensives: 0.5
+    
+    risk_on:
+      sr_loans: 0.5
+      corp_hy: 0.5
+      em_debt: 0.5
+      us_large: 0.5
+      broad_commodity: 1.0
+      us_domestic_cyclical: 1.0
+      dm_intl: 1.0
+      us_global_cyclical: 1.0
+      us_small: 1.5
+      em_equity: 1.5
+  
+  interpretation:
+    efrom_level:
+      positive: "Risk-on mode - investors have risk appetite"
+      negative: "Risk-off mode - investors are risk averse"
+    
+    mom_change:
+      positive: "Add risk exposure for next month"
+      negative: "Reduce risk exposure for next month"
+  
+  historical_performance:
+    period: "Dec 2014 - May 2016"
+    binary_strategy_return: "21%"
+    benchmark_return: "~0% (flat ACWI)"
+    sharpe_improvement: "Significant across all implementations"

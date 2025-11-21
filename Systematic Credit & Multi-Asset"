@@ -1,0 +1,572 @@
+taarss_flow_framework:
+  version: "1.0.0"
+  owner:
+    product_name: "Flow-Based Relative Strength & Risk Meter"
+    sponsoring_desk: "Systematic Credit & Multi-Asset"
+    quant_research_lead: "TBD"
+    quant_dev_lead: "TBD"
+    data_engineering_lead: "TBD"
+
+  # --------------------------------------------------------------------------
+  # 0. ENVIRONMENTS & GLOBAL SETTINGS
+  # --------------------------------------------------------------------------
+  environments:
+    prod:
+      trading_calendar: "XNYS"
+      timezone: "America/New_York"
+      data_latency_sla_minutes: 10          # max lag for intraday updates
+      signal_publish_times:
+        - "16:30"                            # EOD
+    research:
+      trading_calendar: "XNYS"
+      timezone: "UTC"
+      data_latency_sla_minutes: 1440        # end-of-day batch
+
+  # Levels of responsibility for major roles
+  responsibilities:
+    data_engineering:
+      - "Ingest, clean, and store raw ETF, index, and bond-level data."
+      - "Maintain reference data (mapping ETFs to segments; bonds to sectors, ratings, curves)."
+      - "Build transformation jobs to produce flow features and AUM-normalised series."
+    quant_development:
+      - "Implement generic TAARSS regression engine (OLS + OLS-through-origin)."
+      - "Implement signal orchestration, parameter handling, and backtest infra."
+      - "Expose APIs for downstream use (rotation, risk-o-meter, credit strategies)."
+    quant_research:
+      - "Specify which assets/segments/securities are in scope per strategy."
+      - "Choose window lengths, eligibility filters, and sensitivity knobs."
+      - "Design and evaluate trading strategies using the signals."
+      - "Own calibration of asset-specific overrides (e.g., EM, HY, illiquid bonds)."
+
+  # --------------------------------------------------------------------------
+  # 1. RAW INPUTS (DATA ENGINEERING SCOPE)
+  # --------------------------------------------------------------------------
+  raw_inputs:
+
+    etf_market_data:
+      description: >
+        Daily and/or intraday market data for ETFs and indices that proxy
+        asset-class exposure and are used to build TAARSS and EFRoM signals.
+      sources:
+        - name: "Vendor_ETF_Prices"
+          type: "price_and_volume"
+          update_frequency: "daily"
+          required_fields:
+            - ticker                      # ETF ticker, e.g., SPY, EFA, HYG
+            - trade_date
+            - open_price
+            - high_price
+            - low_price
+            - close_price_adj             # adjusted for splits/dividends
+            - volume_shares
+            - vwap_price                  # optional but useful intraday
+        - name: "Vendor_ETF_AUM"
+          type: "aum_and_shares_outstanding"
+          update_frequency: "daily"
+          required_fields:
+            - ticker
+            - trade_date
+            - aum_usd
+            - shares_outstanding
+
+    etf_flows:
+      description: >
+        Derived or vendor-provided daily ETF net cash flows. If not supplied,
+        flows should be computed from changes in shares outstanding × reference NAV.
+      derivation:
+        method: "shares_outstanding_diff"
+        formula: "flow_usd_t = (shares_t - shares_{t-1}) * nav_close_t"
+        nav_source: "Vendor_ETF_Prices.close_price_adj"
+      required_fields:
+        - ticker
+        - trade_date
+        - flow_usd
+
+    bond_trading_data:
+      description: >
+        Bond-level trading events, RFQs, and inventory changes for individual
+        ISINs/CUSIPs, used to generalise TAARSS to single-name credit.
+      sources:
+        - name: "TRACE_or_internal_TRADES"
+          type: "executed_trades"
+          required_fields:
+            - trade_date
+            - trade_time
+            - security_id                # ISIN or CUSIP
+            - side                       # BUY/SELL from dealer perspective
+            - quantity                   # face amount
+            - price_clean
+        - name: "RFQ_stream"
+          type: "rfq_and_quotes"
+          optional: true
+          required_fields:
+            - quote_time
+            - security_id
+            - dealer_id
+            - client_id (optional)
+            - quote_side                 # BID/OFFER
+            - notional_requested
+            - hit_lift_flag              # whether the quote traded
+        - name: "Dealer_Inventory"
+          type: "inventory_timeseries"
+          optional: true
+          required_fields:
+            - report_time
+            - security_id
+            - inventory_face
+            - inventory_mark_to_market
+
+    reference_data:
+      description: >
+        Static and slowly changing mapping tables required to aggregate ETF
+        and bond-level signals to sectors, curves, and rating buckets.
+      etf_classification:
+        source: "Internal_ETF_Metadata_or_vendor"
+        key: "ticker"
+        fields:
+          - asset_class                 # equity, fixed_income, commodity, currency
+          - region                      # e.g., North America, Europe, EM
+          - country                     # e.g., US, Japan
+          - sector                      # GICS sector (for sector/thematic sleeves)
+          - style                       # min_vol, momentum, value, size, etc.
+          - underlying_universe         # index name or description
+      bond_metadata:
+        source: "Bloomberg/Refinitiv/Static DB"
+        key: "security_id"             # ISIN/CUSIP
+        fields:
+          - issuer_id
+          - currency
+          - country_of_risk
+          - sector                      # GICS or internal sector
+          - rating_current              # composite rating (e.g. BBB+)
+          - rating_bucket               # IG/HY, or AA/A/BBB/BB/B/CCC, etc.
+          - maturity_date
+          - coupon_type                 # fixed, float, inflation-linked
+          - benchmark_curve              # e.g., USD_SWAP_3M
+      curve_and_bucket_definitions:
+        duration_buckets:
+          - {name: "1-3y",  min_years: 1, max_years: 3}
+          - {name: "3-5y",  min_years: 3, max_years: 5}
+          - {name: "5-7y",  min_years: 5, max_years: 7}
+          - {name: "7-10y", min_years: 7, max_years: 10}
+          - {name: "10-30y", min_years: 10, max_years: 30}
+        rating_buckets:
+          - {name: "IG",  ratings: ["AAA","AA+","AA","AA-","A+","A","A-","BBB+","BBB","BBB-"]}
+          - {name: "HY",  ratings: ["BB+","BB","BB-","B+","B","B-","CCC+","CCC","CCC-","CC","C","D"]}
+
+  # --------------------------------------------------------------------------
+  # 2. SEGMENT DEFINITIONS (ETF & BOND SCOPES)
+  # --------------------------------------------------------------------------
+  universe:
+
+    etf_segments:
+      description: >
+        ETF-based investment segments (181 in the original DB spec) across
+        asset classes and dimensions (region, country, sector, duration, etc.).
+        Each segment aggregates flows and AUM for one or more ETFs.
+      global_rules:
+        exclude_etn: true
+        exclude_leveraged: true
+        exclude_inverse: true
+        min_segment_aum_usd: 100_000_000
+        min_segment_age_months: 12
+      examples:
+        - segment_id: "equity.region.north_america"
+          name: "North America Equities"
+          asset_class: "equity"
+          dimension: "region"
+          region: "North America"
+          included_tickers: ["SPY","IWM","XLF","XLY"]   # example
+        - segment_id: "fi.sector.us_hy_corp"
+          name: "US High Yield Corporate Bonds (ETF Proxy)"
+          asset_class: "fixed_income"
+          dimension: "sector"
+          sector: "High Yield"
+          included_tickers: ["HYG","JNK"]
+        - segment_id: "commodity.sector.energy"
+          name: "Energy Commodities"
+          asset_class: "commodity"
+          dimension: "sector"
+          included_tickers: ["DBE","USO","UNG"]
+
+    bond_scopes:
+      description: >
+        Credit-focused groupings that map individual bonds (ISIN/CUSIP) into
+        sectors, ratings, and duration buckets so that TAARSS-style methods
+        can be applied either at the ISIN level or aggregated group level.
+      levels:
+        - scope_id: "bond.individual"
+          name: "Individual Bond (ISIN-level)"
+          key: "security_id"
+          description: >
+            Each bond receives its own flow signal based on trade notional,
+            RFQs, or inventory changes, suitable for single-name credit
+            selection and liquidity-aware pricing.
+        - scope_id: "bond.bucket.sector_rating_duration"
+          name: "Bond Buckets by Sector × Rating × Duration"
+          key: ["sector","rating_bucket","duration_bucket"]
+          description: >
+            Bonds are grouped to form synthetic ‘segments’ analogous to ETF
+            segments, used for sector/rating rotation, inventory risk control,
+            or relative-value analysis.
+
+  # --------------------------------------------------------------------------
+  # 3. FEATURE ENGINEERING PIPELINES (DATA ENGINEERING + QUANT DEV)
+  # --------------------------------------------------------------------------
+  feature_pipelines:
+
+    etf_flow_features:
+      owner_role: "data_engineering"
+      description: "Aggregate ETF flows and AUM to segment-level series."
+      steps:
+        - step_id: "etl_etf_raw"
+          type: "ingest"
+          input_sources: ["etf_market_data","etf_flows"]
+          output_table: "stg_etf_raw"
+        - step_id: "compute_segment_flows"
+          type: "aggregation"
+          group_by: ["segment_id","trade_date"]
+          inputs:
+            - "stg_etf_raw"
+            - "reference_data.etf_classification"
+          aggregations:
+            flow_usd: "sum(flow_usd)"
+            aum_usd: "sum(aum_usd)"
+        - step_id: "normalise_flows"
+          type: "feature_engineering"
+          input_table: "segment_flows"
+          output_table: "segment_flow_features"
+          features:
+            - name: "flow_pct_aum"
+              formula: "flow_usd / aum_usd"
+            - name: "cum_flow_pct_aum_window"
+              formula: "rolling_sum(flow_pct_aum, window_days)"
+
+    bond_flow_features:
+      owner_role: "data_engineering"
+      description: >
+        Construct bond-level and bucket-level flow proxies using executed
+        trades, RFQ activity, and inventory changes.
+      steps:
+        - step_id: "etl_bond_trades"
+          type: "ingest"
+          input_sources: ["bond_trading_data"]
+          output_table: "stg_bond_trades"
+        - step_id: "compute_bond_daily_flows"
+          type: "aggregation"
+          group_by: ["security_id","trade_date"]
+          aggregations:
+            traded_notional_usd: "sum(quantity * price_clean * 0.01)"
+            net_dealer_notional_usd: "sum(case when side='BUY' then +quantity*price_clean*0.01 else -quantity*price_clean*0.01 end)"
+            trade_count: "count(*)"
+        - step_id: "merge_inventory"
+          type: "join"
+          primary_table: "bond_daily_flows"
+          secondary_table: "Dealer_Inventory"
+          join_keys: ["security_id","trade_date"]
+          features:
+            - "inventory_face"
+            - "inventory_delta_face"
+        - step_id: "derive_flow_proxies"
+          type: "feature_engineering"
+          input_table: "bond_flow_plus_inventory"
+          output_table: "bond_flow_features"
+          features:
+            - name: "bond_flow_proxy_usd"
+              formula: "0.7*net_dealer_notional_usd + 0.3*inventory_delta_face * price_clean_ref"
+            - name: "bond_flow_sign"
+              formula: "sign(bond_flow_proxy_usd)"
+            - name: "bond_liquidity_score"
+              formula: "log(1 + trade_count)"
+        - step_id: "bucket_bonds"
+          type: "aggregation"
+          description: "Aggregate bond-level features to sector × rating × duration buckets."
+          group_by: ["sector","rating_bucket","duration_bucket","trade_date"]
+          aggregations:
+            bucket_flow_proxy_usd: "sum(bond_flow_proxy_usd)"
+            bucket_aum_proxy_usd: "sum(abs(inventory_face * price_clean_ref))"
+            bucket_liquidity_score: "avg(bond_liquidity_score)"
+        - step_id: "normalise_bond_flows"
+          type: "feature_engineering"
+          input_table: "bond_bucket_flows"
+          output_table: "bond_bucket_flow_features"
+          features:
+            - name: "flow_pct_aum_proxy"
+              formula: "bucket_flow_proxy_usd / bucket_aum_proxy_usd"
+            - name: "cum_flow_pct_aum_proxy_window"
+              formula: "rolling_sum(flow_pct_aum_proxy, window_days)"
+
+  # --------------------------------------------------------------------------
+  # 4. TAARSS SIGNAL ENGINE (QUANT DEV SCOPE)
+  # --------------------------------------------------------------------------
+  taarss_signal_engine:
+    owner_role: "quant_development"
+    description: >
+      Generic implementation of the TAARSS signal: for any time series
+      Y_t (cumulative flow as % of AUM or proxy), compute two regressions
+      over a rolling window: (1) OLS through origin to obtain slope, and
+      (2) OLS with intercept to obtain R²; then TAARSS = slope * R².
+    interfaces:
+      input_tables:
+        - "segment_flow_features"
+        - "bond_bucket_flow_features"
+        - "bond_flow_features"           # optional direct per-ISIN use
+      output_tables:
+        - "taarss_signals"
+
+    global_defaults:
+      window:
+        length_days: 63                  # ~3 months
+        min_observations_ratio: 0.8
+      x_variable: "day_index_in_window"  # 1..N
+      y_variable_by_scope:
+        etf_segment: "cum_flow_pct_aum_window"
+        bond_bucket: "cum_flow_pct_aum_proxy_window"
+        bond_individual: "cum_flow_pct_aum_proxy_window"
+      regressions:
+        magnitude_regression:
+          name: "ols_through_origin"
+          output: "beta1_origin"
+        path_regression:
+          name: "ols_with_intercept"
+          output: "r2_best_fit"
+      formula: "beta1_origin * r2_best_fit"
+      numerical:
+        missing_handling: "drop"
+        robust_regression: false
+
+    strategy_overrides:
+      # Example: more conservative requirements for EM and HY
+      - scope: "etf_segment"
+        selector: "asset_class == 'equity' and region == 'EM'"
+        window:
+          length_days: 90
+        sensitivity:
+          min_r2_threshold: 0.2
+          outlier_clipping:
+            method: "zscore"
+            limits: [-4, 4]
+      - scope: "bond_bucket"
+        selector: "rating_bucket == 'HY'"
+        window:
+          length_days: 90
+        sensitivity:
+          min_r2_threshold: 0.25
+
+    sensitivity_controls:
+      # Default knobs that quant research can tune per strategy
+      min_r2_threshold: 0.1
+      outlier_clipping:
+        enabled: true
+        method: "zscore"
+        limits: [-5, 5]
+      smoothing:
+        enabled: true
+        ema_half_life_days: 5
+
+  # --------------------------------------------------------------------------
+  # 5. SIGNAL POST-PROCESSING & RANKING (QUANT RESEARCH SCOPE)
+  # --------------------------------------------------------------------------
+  postprocessing_and_ranking:
+    owner_role: "quant_research"
+    description: >
+      Convert raw TAARSS values into cross-sectional scores and rankings
+      suitable for portfolio construction.
+    cross_sectional_standardisation:
+      method: "zscore"
+      per_universe:
+        - universe_id: "equity_region_rotation"
+          selector: "asset_class == 'equity' and dimension == 'region'"
+        - universe_id: "fi_sector_rotation"
+          selector: "asset_class == 'fixed_income' and dimension == 'sector'"
+        - universe_id: "bond_bucket_credit"
+          selector: "scope == 'bond_bucket.sector_rating_duration'"
+    ranking_rules:
+      default:
+        higher_is_better: true
+        long_bucket:
+          type: "top_quantile"
+          value: 0.2
+        short_bucket:
+          type: "bottom_quantile"
+          value: 0.2
+      overrides:
+        - universe_id: "bond_bucket_credit"
+          long_bucket:
+            type: "top_n"
+            value: 10
+          short_bucket:
+            type: "bottom_n"
+            value: 10
+
+  # --------------------------------------------------------------------------
+  # 6. EFRoM (ETF FLOW RISK-O-METER) CONFIGURATION
+  # --------------------------------------------------------------------------
+  efrom_riskometer:
+    owner_role: "quant_research"
+    description: >
+      Aggregate selected TAARSS asset-class signals with signed risk factors
+      to produce a scalar risk appetite index (EFRoM). The level is a
+      concurrent indicator of risk-on/off, while its month-over-month change
+      drives tactical allocation overlays.
+    components:
+      # Mapping of TAARSS segments to risk factors (positive = risk-on asset)
+      assets:
+        - segment_id: "fi.duration.us_treasuries"
+          taarss_source: "segment_id:fi.duration.us_treasuries"
+          risk_factor: -1.0
+        - segment_id: "commodity.gold"
+          taarss_source: "segment_id:commodity.sector.gold"
+          risk_factor: -1.0
+        - segment_id: "fi.sector.us_ig_corp"
+          taarss_source: "segment_id:fi.sector.us_ig_corp"
+          risk_factor: -0.5
+        - segment_id: "fi.sector.senior_loans"
+          taarss_source: "segment_id:fi.sector.senior_loans"
+          risk_factor: 0.5
+        - segment_id: "fi.sector.us_hy_corp"
+          taarss_source: "segment_id:fi.sector.us_hy_corp"
+          risk_factor: 0.5
+        - segment_id: "fi.sector.em_debt"
+          taarss_source: "segment_id:fi.sector.em_debt"
+          risk_factor: 0.5
+        - segment_id: "equity.us_defensives"
+          taarss_source: "segment_id:equity.sector.defensives"
+          risk_factor: 0.5
+        - segment_id: "equity.us_large"
+          taarss_source: "segment_id:equity.size.us_large"
+          risk_factor: 1.0
+        - segment_id: "commodity.broad"
+          taarss_source: "segment_id:commodity.sector.broad"
+          risk_factor: 1.0
+        - segment_id: "equity.us_domestic_cyclicals"
+          taarss_source: "segment_id:equity.sector.domestic_cyclicals"
+          risk_factor: 1.0
+        - segment_id: "equity.dm_international"
+          taarss_source: "segment_id:equity.region.dm_international"
+          risk_factor: 1.0
+        - segment_id: "equity.us_global_cyclicals"
+          taarss_source: "segment_id:equity.sector.global_cyclicals"
+          risk_factor: 1.0
+        - segment_id: "equity.us_small"
+          taarss_source: "segment_id:equity.size.us_small"
+          risk_factor: 1.5
+        - segment_id: "equity.em"
+          taarss_source: "segment_id:equity.region.em"
+          risk_factor: 1.5
+    aggregation:
+      formula: "sum_over_assets(taarss_value * risk_factor)"
+      frequency: "monthly"
+      lookback_months_for_change: 1
+    signal_to_allocation_mapping:
+      mode: "binary"
+      thresholds:
+        increase_risk_delta: 0.0  # ΔEFRoM > 0  => add risk
+        decrease_risk_delta: 0.0  # ΔEFRoM < 0  => reduce risk
+      allocation_profiles:
+        risk_on:
+          description: "Move towards riskier assets as per overlay definition."
+        risk_off:
+          description: "Move towards defensive assets as per overlay definition."
+
+  # --------------------------------------------------------------------------
+  # 7. PORTFOLIO USE-CASES (QUANT RESEARCH + QUANT DEV)
+  # --------------------------------------------------------------------------
+  portfolio_strategies:
+
+    etf_rotation_examples:
+      - strategy_id: "equity_region_rotation"
+        owner_role: "quant_research"
+        description: "Cross-sectional rotation among equity regions based on TAARSS."
+        universe_selector: "asset_class == 'equity' and dimension == 'region'"
+        rebalance_frequency: "monthly"
+        position_construction:
+          long_bucket: "top_quantile:0.2"
+          short_bucket: "bottom_quantile:0.2"
+          weighting_scheme: "equal_weight"
+        risk_constraints:
+          max_gross_exposure: 1.0
+          max_net_exposure: 0.5
+
+    bond_bucket_rotation:
+      - strategy_id: "credit_bucket_flow_rotation"
+        owner_role: "quant_research"
+        description: >
+          Rotate among bond buckets (sector × rating × duration) using
+          flow-based TAARSS signals to tilt portfolio towards segments
+          with strong and steady inflows.
+        universe_selector: "scope == 'bond.bucket.sector_rating_duration'"
+        rebalance_frequency: "weekly"
+        position_construction:
+          long_bucket: "top_n:10"
+          short_bucket: "bottom_n:10"
+          weighting_scheme: "vol_weighted"
+        risk_constraints:
+          max_bucket_weight: 0.10
+          sector_neutrality: true
+          duration_target_years: 5.0
+
+    single_name_credit:
+      - strategy_id: "single_name_credit_flow"
+        owner_role: "quant_research"
+        description: >
+          Use ISIN-level TAARSS-style signals (derived from RFQs, trades,
+          and inventory) as explanatory variables in single-name RV models
+          (e.g., spread vs fair value, liquidity premia) and as inputs into
+          quoting and inventory optimisation.
+        signal_inputs:
+          - "bond_flow_features"
+          - "bond_flow_taarss"    # optional, if TAARSS run per ISIN
+        applications:
+          - "spread_fair_value_regression"
+          - "liquidity_score_calibration"
+          - "quote_skew_adjustment"
+          - "inventory_cost_of_carry_estimation"
+
+    ef_risk_overlays:
+      - strategy_id: "60_40_overlay_with_efrom"
+        owner_role: "quant_research"
+        description: >
+          Traditional 60/40 (ACWI/AGG) portfolio with a tactical overlay
+          driven by EFRoM MoM changes. Increase equity weight when ΔEFRoM>0,
+          increase bonds when ΔEFRoM<0.
+        base_portfolio:
+          equity_weight: 0.60
+          bond_weight: 0.40
+        overlay_budget:
+          max_equity_overweight: 0.25    # up to 85/15
+          max_bond_overweight: 0.25      # down to 35/65
+        mapping_from_efrom:
+          positive_delta: "shift_equity_up_to_max"
+          negative_delta: "shift_bonds_up_to_max"
+
+  # --------------------------------------------------------------------------
+  # 8. QA, MONITORING & GOVERNANCE
+  # --------------------------------------------------------------------------
+  quality_and_monitoring:
+    data_quality_checks:
+      - name: "missing_etf_aum"
+        severity: "high"
+        rule: "if any(aum_usd is null) then fail_job"
+      - name: "negative_aum"
+        severity: "high"
+        rule: "aum_usd >= 0"
+      - name: "segment_flow_sanity"
+        severity: "medium"
+        rule: "abs(flow_pct_aum) < 3.0 per day"
+    signal_health_checks:
+      - name: "taarss_distribution"
+        rule: "monitor mean/std of TAARSS by asset_class and alert on drift"
+      - name: "r2_coverage"
+        rule: "percentage of windows with r2 < min_r2_threshold < 20%"
+
+    model_governance:
+      documentation_required:
+        - "Methodology note describing TAARSS and EFRoM maths."
+        - "Universe definition and mapping tables."
+        - "Backtest reports (performance, turnover, capacity, drawdowns)."
+      change_control:
+        config_versioning: "git_tag_on_yaml_changes"
+        approval_roles:
+          - "Head_of_Quant_Research"
+          - "Head_of_Trading_or_PM"

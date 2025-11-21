@@ -1,0 +1,48 @@
+Summary of Key Concepts I've Studied:
+EFRoM (ETF Flow Risk-o-Meter) is a sophisticated risk appetite measurement tool developed by Deutsche Bank that:
+
+Core Methodology:
+
+Combines TAARSS (Tactical Asset Allocation Relative Strength Signal) indicators across 14 asset classes
+Each asset class has a risk factor ranging from -1.5 to +1.5
+Risk-off assets (US Treasuries, Gold) have negative factors
+Risk-on assets (EM, Small Caps) have positive factors
+Formula: EFRoM Level = Σ[TAARSS[i] × Risk Factor[i]]
+
+
+TAARSS Foundation:
+
+Measures ETF flow strength using two regression components:
+
+Magnitude: Slope of regression through origin (β₁)
+Consistency: R² of line of best fit
+TAARSS = β₁ × R²
+
+
+Analyzes normalized cumulative net cash flows as % of AUM
+
+
+Interpretation:
+
+Level: Positive = risk-on mode, Negative = risk-off mode
+Month-over-Month Change: Positive = add risk, Negative = reduce risk
+The change has predictive power for next month's risky asset performance
+
+
+Practical Applications:
+
+Multi-asset portfolios (60/40 variations)
+Smart Beta strategies (Momentum/Min Vol rotation)
+Sector rotation (Utilities/Financials/Materials)
+Both long-only and long/short implementations
+
+
+Historical Performance (Dec 2014 - May 2016):
+
+Binary strategy returned 21% vs flat ACWI performance
+Enhanced Sharpe ratios across various portfolio implementations
+Better drawdown protection during risk-off periods
+
+
+
+I'm ready to answer any technical or mathematical questions about this framework!

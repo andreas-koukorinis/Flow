@@ -1,0 +1,397 @@
+```yaml
+# Fixed Income ETF Flow Risk-o-Meter (FI-EFRoM) and TAARSS Implementation Guide
+
+fixed_income_taarss_computation:
+  title: "Computing TAARSS for Fixed Income ETF Flow Data"
+  
+  step_1_data_collection:
+    description: "Collect and normalize fixed income ETF flow data"
+    process:
+      - collect_daily_flows: "Gather daily net cash flows for bond ETFs in dollars"
+      - normalize_by_aum: "Normalized Flow[t] = Cash Flow[t] / AUM[t]"
+      - create_cumulative: "Y[i] = Σ(Normalized Flow[1 to i])"
+      - segment_by_type: "Separate by duration, credit quality, issuer type"
+    
+  step_2_dual_regression:
+    formula: "TAARSS = β₁(SLRTO) × R²(SLR)"
+    components:
+      slrto:
+        name: "Single Linear Regression Through Origin"
+        equation: "Ŷᵢ = β₁Xᵢ"
+        slope_calculation: "β₁ = Σ(XᵢYᵢ) / Σ(Xᵢ²)"
+        interpretation: "Measures flow velocity into bond segments"
+      slr:
+        name: "Standard Linear Regression"
+        equation: "Ŷᵢ = β₀ + β₁Xᵢ"
+        r_squared: "R² = 1 - [Σ(Yᵢ - Ŷᵢ)²] / [Σ(Yᵢ - Ȳ)²]"
+        interpretation: "Measures consistency of credit/duration preferences"
+    variables:
+      x: "days in calculation period (typically 20-60 for bonds)"
+      y: "cumulative normalized flow as % of AUM"
+
+regression_rationale_fixed_income:
+  title: "Why Both Regressions Matter for Bond ETFs"
+  
+  slope_through_origin:
+    purpose: "Captures flight-to-quality or reach-for-yield intensity"
+    bond_specific_interpretation:
+      positive_treasuries: "Flight to safety"
+      negative_treasuries: "Risk-on, duration selling"
+      positive_hy: "Reach for yield"
+      negative_hy: "Credit risk aversion"
+    advantage: "No baseline assumption - critical for regime changes"
+  
+  standard_regression:
+    purpose: "Measures persistence of credit/duration positioning"
+    bond_specific_interpretation:
+      high_r2: "Sustained credit cycle positioning"
+      low_r2: "Tactical trading or uncertainty"
+    advantage: "Captures structural shifts in bond allocations"
+  
+  combined_signal:
+    strong_risk_off: "Large negative HY slope × High R² + Large positive Treasury slope × High R²"
+    strong_risk_on: "Large positive HY slope × High R² + Large negative Treasury slope × High R²"
+
+bond_specific_anomaly_corrections:
+  title: "Correcting for Fixed Income ETF Flow Anomalies"
+  
+  fed_announcement_effects:
+    detection: "Flows on FOMC days and T+1"
+    correction: "Separate pre/post FOMC regression windows"
+    implementation: |
+      if date in fomc_dates:
+          weight = 0.3  # Reduce weight of FOMC day flows
+      else:
+          weight = 1.0
+  
+  treasury_auction_distortions:
+    issue: "Primary dealer inventory management affects Treasury ETF flows"
+    solution: "Exclude auction dates for Treasury ETFs"
+    calendar: "2Y (monthly), 5Y (monthly), 10Y (8x/year), 30Y (quarterly)"
+  
+  credit_event_spikes:
+    detection: "Flows > 5σ during rating changes or defaults"
+    correction: |
+      if credit_event_detected:
+          use_median_flow = True
+          extend_lookback = 10  # Add 10 days to smooth event impact
+  
+  month_end_index_effects:
+    issue: "Index rebalancing causes artificial flows"
+    correction: "Apply index rebalancing adjustment"
+    formula: |
+      Adjusted_Flow = Raw_Flow - Expected_Index_Flow
+      Expected_Index_Flow = Index_Weight_Change * ETF_AUM
+  
+  duration_hedging_flows:
+    detection: "Large offsetting flows in long vs short duration ETFs"
+    correction: "Net out hedging pairs before TAARSS calculation"
+    pairs:
+      - ["TLT", "SHY"]  # Long vs Short Treasury
+      - ["LQD", "VCSH"] # Long vs Short Corporate
+
+fixed_income_risk_factors:
+  title: "Risk Factor Calibration for Bond ETFs"
+  
+  treasury_etfs:
+    ust_1_3y:
+      ticker_examples: ["SHY", "SCHO"]
+      risk_factor: -0.3
+      duration_mult: 0.5
+    ust_3_7y:
+      ticker_examples: ["IEI", "SCHR"]
+      risk_factor: -0.5
+      duration_mult: 0.8
+    ust_7_10y:
+      ticker_examples: ["IEF", "UTEN"]
+      risk_factor: -0.7
+      duration_mult: 1.0
+    ust_10_20y:
+      ticker_examples: ["TLH", "VGLT"]
+      risk_factor: -0.9
+      duration_mult: 1.2
+    ust_20_plus:
+      ticker_examples: ["TLT", "EDV"]
+      risk_factor: -1.0
+      duration_mult: 1.5
+    tips:
+      ticker_examples: ["TIP", "VTIP"]
+      risk_factor: -0.4
+      duration_mult: 0.7
+  
+  investment_grade_corporate:
+    ig_short:
+      ticker_examples: ["VCSH", "IGSB"]
+      risk_factor: -0.1
+      spread_duration_mult: 0.6
+    ig_intermediate:
+      ticker_examples: ["LQD", "IGIB"]
+      risk_factor: -0.3
+      spread_duration_mult: 1.0
+    ig_long:
+      ticker_examples: ["VCLT", "IGLB"]
+      risk_factor: -0.5
+      spread_duration_mult: 1.4
+    ig_financial:
+      ticker_examples: ["FNCL", "DFNL"]
+      risk_factor: -0.2
+      systemic_adjustment: 1.3
+  
+  high_yield_corporate:
+    hy_broad:
+      ticker_examples: ["HYG", "JNK"]
+      risk_factor: 0.5
+      default_risk_mult: 1.0
+    hy_short:
+      ticker_examples: ["SJNK", "HYS"]
+      risk_factor: 0.3
+      default_risk_mult: 0.7
+    hy_bb_rated:
+      ticker_examples: ["HYLB", "BBJP"]
+      risk_factor: 0.4
+      default_risk_mult: 0.6
+    hy_b_ccc_rated:
+      ticker_examples: ["HYLS", "FALN"]
+      risk_factor: 0.7
+      default_risk_mult: 1.5
+    bank_loans:
+      ticker_examples: ["BKLN", "SRLN"]
+      risk_factor: 0.4
+      floating_rate_adjustment: 0.8
+  
+  emerging_market_debt:
+    em_sovereign_usd:
+      ticker_examples: ["EMB", "VWOB"]
+      risk_factor: 0.6
+      fx_risk: "none"
+    em_sovereign_local:
+      ticker_examples: ["EMLC", "EBND"]
+      risk_factor: 0.8
+      fx_risk: "high"
+    em_corporate:
+      ticker_examples: ["CEMB", "EMCB"]
+      risk_factor: 0.7
+      credit_risk: "high"
+  
+  municipal_bonds:
+    muni_national:
+      ticker_examples: ["MUB", "VTEB"]
+      risk_factor: -0.2
+      tax_adjustment: "yield_equivalent"
+    muni_high_yield:
+      ticker_examples: ["HYD", "HYMB"]
+      risk_factor: 0.2
+      credit_risk: "moderate"
+    muni_state_specific:
+      ticker_examples: ["CMF", "NYF"]
+      risk_factor: -0.15
+      concentration_risk: "high"
+  
+  mortgage_backed:
+    agency_mbs:
+      ticker_examples: ["MBB", "VMBS"]
+      risk_factor: -0.25
+      prepayment_risk: "moderate"
+    non_agency_mbs:
+      ticker_examples: ["JMBS", "CMBS"]
+      risk_factor: 0.3
+      credit_risk: "moderate"
+
+curve_and_spread_analysis:
+  title: "Fixed Income Curve and Spread Positioning"
+  
+  yield_curve_signals:
+    steepener_signal: |
+      curve_steepness = (TAARSS_TLT * -1.0) + (TAARSS_SHY * 1.0)
+      if curve_steepness > 0.5:
+          positioning = "Steepener"
+    
+    flattener_signal: |
+      curve_flatness = (TAARSS_TLT * 1.0) + (TAARSS_SHY * -1.0)
+      if curve_flatness > 0.5:
+          positioning = "Flattener"
+    
+    butterfly_signal: |
+      butterfly = (TAARSS_IEI * 2.0) - (TAARSS_SHY * 1.0) - (TAARSS_TLT * 1.0)
+      if abs(butterfly) > 0.5:
+          positioning = "Butterfly_Active"
+  
+  credit_spread_signals:
+    ig_spread_widening: |
+      ig_spread = (TAARSS_LQD * -1.0) + (TAARSS_IEF * 1.0)
+      if ig_spread > 0.3:
+          signal = "IG_Spreads_Widening"
+    
+    hy_spread_tightening: |
+      hy_spread = (TAARSS_HYG * 1.0) + (TAARSS_IEF * -0.5)
+      if hy_spread > 0.4:
+          signal = "HY_Spreads_Tightening"
+    
+    quality_rotation: |
+      quality = (TAARSS_HYG - TAARSS_LQD) * spread_duration_ratio
+      if quality > 0.2:
+          signal = "Down_In_Quality"
+      elif quality < -0.2:
+          signal = "Up_In_Quality"
+
+fi_efrom_calculation:
+  title: "Fixed Income EFRoM Level Calculation"
+  
+  formula: |
+    FI_EFRoM = Σ[TAARSS[i] × Risk_Factor[i] × Duration_Adj[i] × Spread_Adj[i]]
+  
+  components:
+    duration_adjustment: |
+      Duration_Adj = 1 + (Modified_Duration - 5) * 0.1
+      # Normalizes around 5-year duration
+    
+    spread_adjustment: |
+      Spread_Adj = 1 + (OAS - 100) / 500
+      # Normalizes around 100bp OAS
+    
+    convexity_adjustment: |
+      Convexity_Adj = 1 + (Convexity / 100) * 0.05
+      # Applied to long duration bonds only
+  
+  aggregation_weights:
+    treasuries: 0.30
+    investment_grade: 0.25
+    high_yield: 0.20
+    emerging_markets: 0.15
+    municipals: 0.05
+    mortgage_backed: 0.05
+
+platform_integration:
+  title: "Fixed Income Research Platform Integration"
+  
+  data_architecture: |
+    class FixedIncomeTAARSS:
+        def __init__(self):
+            self.bloomberg_api = BloombergAPI()
+            self.flow_provider = ETFFlowProvider()
+            self.yield_curve = YieldCurveModel()
+            self.credit_model = CreditRiskModel()
+        
+        def calculate_fi_taarss(self, bond_etf, lookback=40):
+            # Get flows and clean for bond-specific anomalies
+            flows = self.get_bond_etf_flows(bond_etf)
+            flows = self.adjust_for_auctions(flows, bond_etf)
+            flows = self.adjust_for_fomc(flows)
+            
+            # Calculate duration-adjusted TAARSS
+            duration = self.bloomberg_api.get_duration(bond_etf)
+            taarss = self.base_taarss(flows)
+            return taarss * self.duration_factor(duration)
+  
+  risk_monitoring: |
+    class BondRiskMonitor:
+        def check_regime_change(self):
+            treasury_signal = self.calc_treasury_composite()
+            credit_signal = self.calc_credit_composite()
+            
+            if treasury_signal < -0.5 and credit_signal < -0.5:
+                return "RISK_OFF_EXTREME"
+            elif treasury_signal > 0.5 and credit_signal > 0.5:
+                return "RISK_ON_EXTREME"
+            else:
+                return "MIXED"
+  
+  signal_generation: |
+    def generate_fi_signals():
+        signals = {}
+        
+        # Duration positioning
+        signals['duration'] = {
+            'level': calculate_duration_efrom(),
+            'signal': 'LONG' if signals['duration']['level'] > 0.3 else 'SHORT',
+            'confidence': min(abs(signals['duration']['level']) * 2, 1.0)
+        }
+        
+        # Credit positioning
+        signals['credit'] = {
+            'level': calculate_credit_efrom(),
+            'signal': 'OVERWEIGHT' if signals['credit']['level'] > 0.2 else 'UNDERWEIGHT',
+            'sectors': rank_credit_sectors()
+        }
+        
+        # Curve positioning
+        signals['curve'] = {
+            'level': calculate_curve_efrom(),
+            'trade': identify_curve_trade(),
+            'keypoints': [2, 5, 10, 30]
+        }
+        
+        return signals
+  
+  portfolio_implementation: |
+    class FIPortfolioManager:
+        def adjust_portfolio(self, efrom_signals):
+            adjustments = []
+            
+            # Duration adjustment
+            if efrom_signals['duration']['signal'] == 'LONG':
+                adjustments.append({
+                    'action': 'INCREASE',
+                    'instrument': 'TLT',
+                    'size': efrom_signals['duration']['confidence'] * base_size
+                })
+            
+            # Credit adjustment
+            if efrom_signals['credit']['signal'] == 'OVERWEIGHT':
+                for sector in efrom_signals['credit']['sectors'][:3]:
+                    adjustments.append({
+                        'action': 'BUY',
+                        'instrument': sector['etf'],
+                        'size': sector['score'] * base_size
+                    })
+            
+            return adjustments
+
+interpretation_guidelines:
+  title: "Fixed Income EFRoM Interpretation"
+  
+  regime_identification:
+    strong_risk_off:
+      indicators:
+        - "FI_EFRoM < -1.5"
+        - "Treasury TAARSS > 0.5"
+        - "HY TAARSS < -0.3"
+      action: "Maximum duration, minimum credit risk"
+    
+    moderate_risk_off:
+      indicators:
+        - "-1.5 < FI_EFRoM < -0.5"
+        - "IG outflows less severe than HY"
+      action: "Barbell duration, quality credit only"
+    
+    neutral:
+      indicators:
+        - "-0.5 < FI_EFRoM < 0.5"
+        - "Mixed signals across sectors"
+      action: "Benchmark weights, tactical opportunities"
+    
+    moderate_risk_on:
+      indicators:
+        - "0.5 < FI_EFRoM < 1.5"
+        - "HY TAARSS > 0.3"
+        - "Treasury TAARSS < -0.2"
+      action: "Reduce duration, add credit"
+    
+    strong_risk_on:
+      indicators:
+        - "FI_EFRoM > 1.5"
+        - "Bank loan inflows strong"
+        - "Long Treasury outflows"
+      action: "Minimum duration, maximum credit"
+  
+  signal_reliability:
+    high_confidence:
+      - "R² > 0.8 across multiple segments"
+      - "Consistent direction for 3+ days"
+      - "Confirming signals from related ETFs"
+    
+    low_confidence:
+      - "R² < 0.4"
+      - "Conflicting signals within asset class"
+      - "Recent major market events"
+```
